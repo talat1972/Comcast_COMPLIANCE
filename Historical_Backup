@@ -1,0 +1,307 @@
+import MySQLdb
+import time
+from datetime import datetime, timedelta
+import logging
+import sys
+import BackupChecker
+from logging.handlers import RotatingFileHandler
+#from heartbeat import Heartbeat
+
+class HistoricalArchiver(object):
+
+    def __init__(self):
+        self.setup_log()
+        today = datetime.now()
+        if today.weekday() > 4:
+            sys.exit("I don't always backup data, but when I do, it's on a weekday.")
+
+        help = ("""\nSubsets of 'ineoall' tables 'ms_history_no_null_DO_NOT_REMOVE' and
+        'cdvr_history_no_null_DO_NOT_REMOVE' on the 'db4' server are backed up to flat files using
+        this script.
+
+        Monthly data is divided into thirds, 1-9, 10-19, 20-XY. This script will operate on the last
+        full data set available.
+
+        Currently, the script is being executed by a cron job on the 'dash server':
+
+        0 0 10 * * python backup_ms_history.py 10 >> /tmp/backup_ms_history.log
+        0 0 20 * * python backup_ms_history.py 20 >> /tmp/backup_ms_history.log
+        0 0 1 * * python backup_ms_history.py 1 >> /tmp/backup_ms_history.log
+
+        As an example, 'MS_JAN1_2015' and 'CDVR_MS_JAN1_2015' tables are created on the 10th for
+        data from the 1st through the 9th. The tables are dumped, zipped, & copied to conf.BACKUP_HOST
+        before they are dropped. *_JAN2_2015 would account for the 10th through the 19th, and
+        and *_JAN3_2015 would account for the 20th through the last day of the month.
+
+        Historical data needs be backed up for at least on year, though a mechanism for deleting data
+        has not yet been automated.\n""")
+
+        if len(sys.argv) > 1:
+            sys.exit(help)
+
+        end_date = self.get_end_date()
+        self.THIRD = self.SD = self.ED = 0
+
+        if end_date.day == 9:
+            self.THIRD = 1
+            self.SD = 1
+        elif end_date.day == 19:
+            self.THIRD = 2
+            self.SD = 10
+        elif end_date.day > 27:
+            self.THIRD = 3
+            self.SD = 20
+
+        self.ED = end_date.day
+        self.MONTH = end_date.strftime("%b").upper()
+        self.YYYY = end_date.year
+        self.MM = end_date.month
+        self.table_stem = "_%s%s_%s" % (self.MONTH, self.THIRD, self.YYYY)
+
+    def setup_log(self):
+        self.logger = logging.getLogger('Rotating HistoricalArchiver Log')
+        self.logger.setLevel(logging.DEBUG)
+        handler = RotatingFileHandler('/tmp/HistoricalArchiver.log', maxBytes=1000000, backupCount=5)
+        self.logger.addHandler(handler)
+
+    def get_end_date(self):
+        now = datetime.now()
+        day = now.day
+
+        if day >= 1 and day < 10:
+            while now.day < 27:
+                now -= timedelta(days=1)
+        elif day > 9 and day < 20:
+            while now.day > 9:
+                now -= timedelta(days=1)
+        elif day > 19:
+            while now.day > 19:
+                now -= timedelta(days=1)
+        return now
+
+    def run(self):
+        #open connection to icedb
+        conn = MySQLdb.connect(host=conf.CHI_HOST,
+                               user=conf.CHI_USER,
+                               passwd=conf.CHI_PASS,
+                               db=conf.CHI_DB)
+        x = conn.cursor()
+
+        #CDVR_HISTORY
+        #create temp table
+        try:
+            cdvr_create_query = "create table CDVR_MS%s like cdvr_history_no_null_DO_NOT_REMOVE" % (self.table_stem)
+            x.execute(cdvr_create_query)
+            conn.commit()
+        except Exception, e:
+            error = "Unable to create CDVR_MS%s" % (self.table_stem)
+            print error + str(e)
+
+        #insert into temp table
+        try:
+            cdvr_insert_query = "insert into CDVR_MS%s select * from cdvr_history_no_null_DO_NOT_REMOVE where rpt_start_date_yyyymmdd >= '%s-%s-%s' and rpt_start_date_yyyymmdd <= '%s-%s-%s'" % (self.table_stem, self.YYYY, self.MM, self.SD, self.YYYY, self.MM, self.ED)
+
+            x.execute(cdvr_insert_query)
+            conn.commit()
+        except Exception, e:
+            error = "Unable to insert into CDVR_MS%s" % (self.table_stem)
+            print error + str(e)
+
+        #bc = BackupChecker.BackupChecker()
+        ##bc.validate_distinct_dates('CDVR_MS%s' % (self.table_stem), self.ED)
+        ##bc.validate_distinct_medius('CDVR_MS%s' % (self.table_stem))
+
+        #make directory if it doesn't exist (on the first of the new year)
+        ##cdvr_mkdir = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "mkdir", "-p", "/db/mysql/tek/CDVR_HISTORY/%s" % (self.YYYY)]
+        ##p = subprocess.Popen(cdvr_mkdir, stdout=subprocess.PIPE)
+        ##out, err = p.communicate()
+
+        #dump temp table
+        cdvr_mysql_dump = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "mysqldump", "-u"+conf.CHI_USER, "-p"+conf.CHI_PASS, conf.CHI_DB, "CDVR_MS%s" % (self.table_stem), ">", "/db/mysql/tek/CDVR_HISTORY/%s/CDVR_MS%s" % (self.YYYY, self.table_stem)]
+        p1 = subprocess.Popen(cdvr_mysql_dump, stdout=subprocess.PIPE)
+        out, err = p1.communicate()
+
+        #gzip dump
+        cdvr_gzip = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "gzip", "/db/mysql/tek/CDVR_HISTORY/%s/CDVR_MS%s" % (self.YYYY, self.table_stem)]
+        p2 = subprocess.Popen(cdvr_gzip, stdout=subprocess.PIPE)
+        out, err = p2.communicate()
+
+        #make directory if it doesn't exist (on the first of the new year)
+        #cdvr_mkdir = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "ssh", conf.SSH_USER+"@"+conf.BACKUP_HOST, "mkdir", "-p", "/var/TEK_HISTORY/CDVR_HISTORY/%s" % (self.YYYY)]
+        #p = subprocess.Popen(cdvr_mkdir, stdout=subprocess.PIPE)
+        #out, err = p.communicate()
+
+
+        #MS_HISTORY
+        #create temp table
+        try:
+            ms_create_query = "create table MS%s like ms_history_no_null_DO_NOT_REMOVE" % (self.table_stem)
+            x.execute(ms_create_query)
+            conn.commit()
+        except Exception, e:
+            error = "Unable to create MS%s" % (self.table_stem)
+            print error + str(e)
+
+        #insert into temp table
+        try:
+            ms_insert_query = "insert into MS%s select * from ms_history_no_null_DO_NOT_REMOVE where rpt_start_date_yyyymmdd >= '%s-%s-%s' and rpt_start_date_yyyymmdd <= '%s-%s-%s'" % (self.table_stem, self.YYYY, self.MM, self.SD, self.YYYY, self.MM, self.ED)
+            x.execute(ms_insert_query)
+            conn.commit()
+        except Exception, e:
+            error = "Unable to insert into MS%s" % (self.table_stem)
+            print error + str(e)
+
+        #bc.validate_distinct_dates('MS%s' % (self.table_stem), self.ED)
+        #bc.validate_distinct_medius('MS%s' % (self.table_stem))
+
+        #make directory if it doesn't exist (on the first of the new year)
+        ##ms_mkdir = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "mkdir", "-p", "/db/mysql/tek/MS_HISTORY/%s" % (self.YYYY)]
+        ##p = subprocess.Popen(ms_mkdir, stdout=subprocess.PIPE)
+        ##out, err = p.communicate()
+
+        #dump temp table
+        ms_mysql_dump = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "mysqldump", "-u"+conf.CHI_USER, "-p"+conf.CHI_PASS, conf.CHI_DB, "MS%s" % (self.table_stem), ">", "/db/mysql/tek/MS_HISTORY/%s/MS%s" % (self.YYYY, self.table_stem)]
+        p1 = subprocess.Popen(ms_mysql_dump, stdout=subprocess.PIPE)
+        out, err = p1.communicate()
+
+        #gzip dump
+        ms_gzip = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "gzip", "/db/mysql/tek/MS_HISTORY/%s/MS%s" % (self.YYYY, self.table_stem)]
+        p2 = subprocess.Popen(ms_gzip, stdout=subprocess.PIPE)
+        out, err = p2.communicate()
+
+            
+        #DCF_HISTORY
+        #create temp table
+        try:
+            dcf_create_query = "create table DCF%s like ms_history_DCF_DO_NOT_REMOVE" % (self.table_stem)
+            x.execute(dcf_create_query)
+            conn.commit()
+        except Exception, e:
+            error = "Unable to create DCF%s" % (self.table_stem)
+            print error + str(e)
+
+        #insert into temp table
+        try:
+            dcf_insert_query = "insert into DCF%s select * from ms_history_DCF_DO_NOT_REMOVE where rpt_start_date_yyyymmdd >= '%s-%s-%s' and rpt_start_date_yyyymmdd <= '%s-%s-%s'" % (self.table_stem, self.YYYY, self.MM, self.SD, self.YYYY, self.MM, self.ED)
+            x.execute(dcf_insert_query)
+            conn.commit()
+        except Exception, e:
+            error = "Unable to insert into DCF%s" % (self.table_stem)
+            print error + str(e)
+
+        #bc.validate_distinct_dates('DCF%s' % (self.table_stem), self.ED)
+        #bc.validate_distinct_medius('DCF%s' % (self.table_stem))
+
+        #make directory if it doesn't exist (on the first of the new year)
+        dcf_mkdir = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "mkdir", "-p", "/db/mysql/tek/DCF_HISTORY/%s" % (self.YYYY)]
+        p = subprocess.Popen(dcf_mkdir, stdout=subprocess.PIPE)
+        out, err = p.communicate()
+
+        #dump temp table
+        dcf_mysql_dump = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "mysqldump", "-u"+conf.CHI_USER, "-p"+conf.CHI_PASS, conf.CHI_DB, "DCF%s" % (self.table_stem), ">", "/db/mysql/tek/DCF_HISTORY/%s/MS%s" % (self.YYYY, self.table_stem)]
+        p1 = subprocess.Popen(dcf_mysql_dump, stdout=subprocess.PIPE)
+        out, err = p1.communicate()
+
+        #gzip dump
+        dcf_gzip = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "gzip", "/db/mysql/tek/DCF_HISTORY/%s/MS%s" % (self.YYYY, self.table_stem)]
+        p2 = subprocess.Popen(dcf_gzip, stdout=subprocess.PIPE)
+        out, err = p2.communicate()
+
+        #make directory if it doesn't exist (on the first of the new year)
+        #dcf_mkdir = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "ssh", conf.SSH_USER+"@"+conf.BACKUP_HOST, "mkdir", "-p", "/var/TEK_HISTORY/DCF_HISTORY/%s" % (self.YYYY)]
+        #p = subprocess.Popen(dcf_mkdir, stdout=subprocess.PIPE)
+        #out, err = p.communicate()
+
+       	#dcf_mkdir = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "ssh", conf.SSH_USER+"@"+conf.DBPO2_HOST, "mkdir", "-p", "/db/mysql/DCF_HISTORY/%s" % (self.YYYY)]
+       	#p = subprocess.Popen(dcf_mkdir, stdout=subprocess.PIPE)
+        #out, err = p.communicate()
+
+        #close connection to db4
+        
+        cdvr_copy_to_backup = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "scp", "/db/mysql/tek/CDVR_HISTORY/%s/CDVR_MS%s.gz" % (self.YYYY, self.table_stem), conf.SSH_USER+"@"+conf.BACKUP_HOST+":/var/TEK_HISTORY/CDVR_HISTORY/%s/." % (self.YYYY)]
+        p = subprocess.Popen(cdvr_copy_to_backup, stdout=subprocess.PIPE)
+        out, err = p.communicate()
+
+        cdvr_copy_to_backup = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "scp", "/db/mysql/tek/CDVR_HISTORY/%s/CDVR_MS%s.gz" % (self.YYYY, self.table_stem), conf.SSH_USER+"@"+conf.BACKUP_HOST_SECONDARY+":/db/mysql/CDVR_HISTORY/%s/." % (self.YYYY)]
+        p = subprocess.Popen(cdvr_copy_to_backup, stdout=subprocess.PIPE)
+        out, err = p.communicate()
+
+
+
+        ms_copy_to_backup = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "scp", "/db/mysql/tek/MS_HISTORY/%s/MS%s.gz" % (self.YYYY, self.table_stem), conf.SSH_USER+"@"+conf.BACKUP_HOST+":/var/TEK_HISTORY/MS_HISTORY/%s/." % (self.YYYY)]
+        p = subprocess.Popen(ms_copy_to_backup, stdout=subprocess.PIPE)
+        out, err = p.communicate()
+
+        ms_copy_to_backup = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "scp", "/db/mysql/tek/MS_HISTORY/%s/MS%s.gz" % (self.YYYY, self.table_stem), conf.SSH_USER+"@"+conf.BACKUP_HOST_SECONDARY+":/db/mysql/MS_HISTORY/%s/." % (self.YYYY)]
+        p = subprocess.Popen(ms_copy_to_backup, stdout=subprocess.PIPE)
+        out, err = p.communicate()
+
+                 
+
+        dcf_copy_to_backup = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "scp", "/db/mysql/tek/DCF_HISTORY/%s/DCF%s.gz" % (self.YYYY, self.table_stem), conf.SSH_USER+"@"+conf.BACKUP_HOST+":/var/TEK_HISTORY/DCF_HISTORY/%s/." % (self.YYYY)]
+        p = subprocess.Popen(dcf_copy_to_backup, stdout=subprocess.PIPE)
+        out, err = p.communicate()
+
+        dcf_copy_to_backup = ["ssh", conf.SSH_USER+"@"+conf.CHI_HOST, "scp", "/db/mysql/tek/DCF_HISTORY/%s/DCF%s.gz" % (self.YYYY, self.table_stem), conf.SSH_USER+"@"+conf.BACKUP_HOST_SECONDARY+":/db/mysql/DCF_HISTORY/%s/." % (self.YYYY)]
+        p = subprocess.Popen(dcf_copy_to_backup, stdout=subprocess.PIPE)
+        out, err = p.communicate()
+
+
+
+        #drop the temp tables
+        try:
+            cdvr_drop = "drop table CDVR_MS%s" % (self.table_stem)
+            x.execute(cdvr_drop)
+            conn.commit()
+        except Exception, e:
+            error = "Unable to drop table CDVR_MS%s" % (self.table_stem)
+            print error + str(e)
+
+
+        try:
+            ms_drop = "drop table MS%s" % (self.table_stem)
+            x.execute(ms_drop)
+            conn.commit()
+        except Exception, e:
+            error = "Unable to drop MS%s" % (self.table_stem)
+            print error + str(e)
+
+        try:
+            dcf_drop = "drop table DCF%s" % (self.table_stem)
+            x.execute(dcf_drop)
+            conn.commit()
+        except Exception, e:
+            error = "Unable to drop DCF%s" % (self.table_stem)
+            print error + str(e)
+
+
+
+
+
+        conn.close()
+
+        #send an email if size of log file or zip files are indicative of a failure
+        bc.check(self.MONTH, self.THIRD, self.YYYY)
+
+    def send_alert(self, subject, body):
+        bc = BackupChecker.BackupChecker()
+        bc.send_alert(subject, body)
+
+if __name__ == '__main__':
+    ha = HistoricalArchiver()
+    try:
+        ha.send_alert('HistoricalArchiver.py has started', 'Archiving data on db4')
+        ha.run()
+        #time_limit = 6
+        #hb = Heartbeat(ha.__class__.__name__, 0, conf.NAME, conf.HB_EMAIL, 'LVV:SYS', time_limit*60, appVersion='0.1', log=ha.logger)
+
+        #if _is_down:
+        #    ha.send_alert('HistoricalArchiver has failed!', ' API is down. Visit /tmp/HistoricalArchiver.log for more information.')
+        #else:
+        #    ha.logger.error('Heartbeat was sent. ')# + str(hb))
+        #    hb.send_hb()
+
+    except Exception, e:
+        message = 'HistoricalArchiver has failed. ' + str(e)
+        ha.logger.error(message)
+        ha.send_alert('HistoricalArchiver has failed!', message + '. Visit /tmp/HistoricalArchiver.log for more information.')
