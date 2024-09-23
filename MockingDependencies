@@ -1,0 +1,17 @@
+import pytest
+from unittest import mock
+from datetime import datetime
+from my_script import HistoricalArchiver  # Assuming your script is named my_script.py
+
+@pytest.fixture
+def mock_db_connection():
+    with mock.patch('MySQLdb.connect') as mock_connect:
+        mock_cursor = mock.Mock()
+        mock_connect.return_value.cursor.return_value = mock_cursor
+        yield mock_connect, mock_cursor
+
+@pytest.fixture
+def mock_subprocess():
+    with mock.patch('subprocess.Popen') as mock_popen:
+        mock_popen.return_value.communicate.return_value = (b'output', b'error')
+        yield mock_popen
